@@ -1,0 +1,80 @@
+diff --git a/pkg/kube/statuswait.go b/pkg/kube/statuswait.go
+index 91eec30ef..92ff92e12 100644
+--- a/pkg/kube/statuswait.go
++++ b/pkg/kube/statuswait.go
+@@ -238,9 +238,14 @@ func contextWithTimeout(ctx context.Context, timeout time.Duration) (context.Con
+ }
+ 
+ func statusObserver(cancel context.CancelFunc, desired status.Status, logger *slog.Logger) collector.ObserverFunc {
+-	return func(statusCollector *collector.ResourceStatusCollector, _ event.Event) {
++	initialSyncComplete := false
++	return func(statusCollector *collector.ResourceStatusCollector, e event.Event) {
++		if e.Type == event.SyncEvent {
++			initialSyncComplete = true
++		}
+ 		var rss []*event.ResourceStatus
+ 		var nonDesiredResources []*event.ResourceStatus
++		var unknownSkipped int
+ 		for _, rs := range statusCollector.ResourceStatuses {
+ 			if rs == nil {
+ 				continue
+@@ -248,6 +253,7 @@ func statusObserver(cancel context.CancelFunc, desired status.Status, logger *sl
+ 			// If a resource is already deleted before waiting has started, it will show as unknown.
+ 			// This check ensures we don't wait forever for a resource that is already deleted.
+ 			if rs.Status == status.UnknownStatus && desired == status.NotFoundStatus {
++			unknownSkipped++
+ 				continue
+ 			}
+ 			// Failed is a terminal state. This check ensures we don't wait forever for a resource
+@@ -261,6 +267,14 @@ func statusObserver(cancel context.CancelFunc, desired status.Status, logger *sl
+ 			}
+ 	}
+ 
++		// Unknown is the collector's initial status before informer synchronization.
++		// Do not treat an all-Unknown observation as successful deletion until the
++		// watcher confirms its cache is primed. After SyncEvent, remaining Unknown
++		// resources are absent and can be skipped without waiting for the timeout.
++		if desired == status.NotFoundStatus && !initialSyncComplete && unknownSkipped > 0 && len(rss) == 0 {
++			return
++		}
++
+ 	if aggregator.AggregateStatus(rss, desired) == desired {
+ 		logger.Debug("all resources achieved desired status", "desiredStatus", desired, "resourceCount", len(rss))
+ 		cancel()
+diff --git a/pkg/kube/statuswait_test.go b/pkg/kube/statuswait_test.go
+index 5f5f5d051..e35cd5d14 100644
+--- a/pkg/kube/statuswait_test.go
++++ b/pkg/kube/statuswait_test.go
+@@ -26,6 +26,7 @@ import (
+ 	" testing"
+ 	" time"
+ 
++	"github.com/fluxcd/cli-utils/pkg/kstatus/polling/collector"
+ 	"github.com/fluxcd/cli-utils/pkg/kstatus/polling/engine"
+ 	"github.com/fluxcd/cli-utils/pkg/kstatus/polling/event"
+ 	"github.com/fluxcd/cli-utils/pkg/kstatus/status"
+@@ -290,6 +291,24 @@ func getResourceListFromRuntimeObjs(t *testing.T, c *Client, objs []runtime.Obje
+ 	return resourceList
+ }
+ 
++func TestStatusObserverWaitForDeleteDefersUnknownUntilInitialSync(t *testing.T) {
++	t.Parallel()
++	id := object.ObjMetadata{
++		Namespace: "ns",
++		Name:      "pod",
++		GroupKind: schema.GroupKind{Kind: "Pod"},
++}
++	statusCollector := collector.NewResourceStatusCollector([]object.ObjMetadata{id})
++	var cancelled atomic.Bool
++	observer := statusObserver(func() { cancelled.Store(true) }, status.NotFoundStatus, slog.Default())
++
++	observer(statusCollector, event.Event{Type: event.ResourceUpdateEvent})
++	assert.False(t, cancelled.Load(), "transient Unknown status must not complete delete wait before initial sync")
++
++	observer(statusCollector, event.Event{Type: event.SyncEvent})
++	assert.True(t, cancelled.Load(), "Unknown status after initial sync means the resource is already absent")
++}
++
+ func TestStatusWaitForDelete(t *testing.T) {
+ 	t.Parallel()
+ 	tests := []struct {
